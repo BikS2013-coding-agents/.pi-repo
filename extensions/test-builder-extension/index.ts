@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -7,9 +8,17 @@ import { Type } from "typebox";
 
 const TOOL_NAME = "test_builder_subagent";
 const PROMPT_FILE = "test-builder-agent.md";
-const CHILD_TOOLS = "read,write,edit,grep,find,ls,bash";
+const CHILD_TOOLS = "read,write,edit,grep,find,ls,bash,contact_supervisor,intercom";
 const FINAL_TEXT_CAP = 20 * 1024;
 const DIAGNOSTIC_TEXT_CAP = 4 * 1024;
+
+const SAME_MODEL_ALIASES = new Set(["same", "current", "caller", "calling-agent", "same-as-calling-agent"]);
+const DEFAULT_INTERCOM_TARGET_PREFIX = "subagent-chat";
+const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
+const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
+const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
+const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
+const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
 
 type JsonEvent = {
 	type?: string;
@@ -58,15 +67,54 @@ function messageToText(message: unknown): string {
 	return contentToText((message as MessageLike).content);
 }
 
+function getEventRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function formatSupervisorWaitNotice(args: Record<string, unknown>, bridge: { orchestratorTarget: string; childSessionName: string } | undefined): string {
+	const reason = typeof args.reason === "string" ? args.reason : "unknown";
+	const message = typeof args.message === "string" ? args.message : "(no message text supplied)";
+	const lines = [
+		`Test-builder subagent called contact_supervisor with reason=${reason}.`,
+		"The test-builder subagent is paused waiting for the supervisor reply; this is expected for need_decision/interview_request.",
+		bridge ? `Supervisor target: ${bridge.orchestratorTarget}` : undefined,
+		bridge ? `Child intercom session: ${bridge.childSessionName}` : undefined,
+		"Reply from the parent Pi session with the immediate slash command:",
+		'/intercom-reply <your decision>',
+		"",
+		"Do not type a normal steering message like 'reply to the test-builder...': steering is queued until the current test_builder_subagent tool finishes, so it cannot unblock the waiting child.",
+		"If the agent is already idle, the regular tool form also works: intercom({ action: \"reply\", message: \"<your decision>\" })",
+		"",
+		"Test-builder message:",
+		message,
+	];
+	return lines.filter((line): line is string => line !== undefined).join("\n");
+}
+
 function resolveChildModelSelector(rawModel: string | undefined, currentModel: { provider?: string; id?: string } | undefined): string | undefined {
 	const requested = rawModel?.trim();
-	if (requested && !["same", "current", "caller", "calling-agent", "same-as-calling-agent"].includes(requested.toLowerCase())) {
-		return requested;
-	}
-	if (currentModel?.provider && currentModel?.id) {
-		return `${currentModel.provider}/${currentModel.id}`;
-	}
+	if (requested && !SAME_MODEL_ALIASES.has(requested.toLowerCase())) return requested;
+	if (currentModel?.provider && currentModel?.id) return `${currentModel.provider}/${currentModel.id}`;
 	return undefined;
+}
+
+function sanitizeIntercomTargetPart(value: string): string {
+	return value
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "") || "agent";
+}
+
+function resolveIntercomSessionTarget(sessionName: string | undefined, sessionId: string): string {
+	const trimmedName = sessionName?.trim();
+	if (trimmedName) return trimmedName;
+	const normalizedSessionId = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
+	return `${DEFAULT_INTERCOM_TARGET_PREFIX}-${normalizedSessionId.slice(0, 8)}`;
+}
+
+function resolveSubagentIntercomTarget(runId: string, agent: string, index: number): string {
+	return `subagent-${sanitizeIntercomTargetPart(agent)}-${sanitizeIntercomTargetPart(runId)}-${index + 1}`;
 }
 
 function truncateText(text: string, maxBytes: number): string {
@@ -158,6 +206,13 @@ async function runChildPi(options: {
 	task: string;
 	cwd: string;
 	model?: string;
+	intercomBridge?: {
+		orchestratorTarget: string;
+		runId: string;
+		childAgent: string;
+		childIndex: number;
+		childSessionName: string;
+	};
 	signal?: AbortSignal;
 	onText?: (text: string) => void;
 }): Promise<{
@@ -166,16 +221,28 @@ async function runChildPi(options: {
 	stderr: string;
 	messages: MessageLike[];
 	finalText: string;
+	observedModel?: string;
 }> {
-	const args = ["--mode", "json", "-p", "--no-session", "--tools", CHILD_TOOLS, "--append-system-prompt", options.promptPath];
+	const args = ["--mode", "json", "-p", "--no-session", "--no-skills", "--tools", CHILD_TOOLS, "--append-system-prompt", options.promptPath];
 	if (options.model?.trim()) args.push("--model", options.model.trim());
+	if (options.intercomBridge?.childSessionName) args.push("--name", options.intercomBridge.childSessionName);
 	args.push(options.task);
+
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	if (options.intercomBridge) {
+		childEnv[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = options.intercomBridge.orchestratorTarget;
+		childEnv[SUBAGENT_RUN_ID_ENV] = options.intercomBridge.runId;
+		childEnv[SUBAGENT_CHILD_AGENT_ENV] = options.intercomBridge.childAgent;
+		childEnv[SUBAGENT_CHILD_INDEX_ENV] = String(options.intercomBridge.childIndex);
+		childEnv[SUBAGENT_INTERCOM_SESSION_NAME_ENV] = options.intercomBridge.childSessionName;
+	}
 
 	return await new Promise((resolve) => {
 		const child = spawn("pi", args, {
 			cwd: options.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			env: childEnv,
 		});
 
 		let stdout = "";
@@ -183,6 +250,7 @@ async function runChildPi(options: {
 		let lineBuffer = "";
 		const messages: MessageLike[] = [];
 		let finalText = "";
+		let observedModel: string | undefined;
 		let wasAborted = false;
 
 		const processLine = (line: string) => {
@@ -196,9 +264,22 @@ async function runChildPi(options: {
 				return;
 			}
 
+			if (event.type === "tool_execution_start" && event.toolName === "contact_supervisor") {
+				const args = getEventRecord(event.args) ?? getEventRecord(event.input) ?? {};
+				options.onText?.(formatSupervisorWaitNotice(args, options.intercomBridge));
+			}
+
+			if (event.type === "tool_result_end" && event.message && typeof event.message === "object") {
+				const message = event.message as MessageLike;
+				messages.push(message);
+				const text = messageToText(message).trim();
+				if (text) options.onText?.(truncateText(text, FINAL_TEXT_CAP));
+			}
+
 			if (event.type === "message_end" && event.message && typeof event.message === "object") {
 				const message = event.message as MessageLike;
 				messages.push(message);
+				if (message.model) observedModel = message.model;
 				if (message.role === "assistant") {
 					const text = messageToText(message).trim();
 					if (text) {
@@ -226,8 +307,8 @@ async function runChildPi(options: {
 
 		child.on("close", (code) => {
 			if (lineBuffer.trim()) processLine(lineBuffer);
-			if (wasAborted && !stderr.includes("aborted")) stderr += "Child Pi process aborted by parent signal.\n";
-			resolve({ exitCode: code ?? 1, stdout, stderr, messages, finalText });
+			if (wasAborted && !stderr.includes("aborted")) stderr += "Child Pi test-builder process aborted by parent signal.\n";
+			resolve({ exitCode: code ?? 1, stdout, stderr, messages, finalText, observedModel });
 		});
 
 		if (options.signal) {
@@ -351,13 +432,34 @@ export default function testBuilderSubagentExtension(pi: ExtensionAPI) {
 				testDir: params.test_dir,
 				mode,
 			});
-			onUpdate?.({ content: [{ type: "text", text: `Starting test-builder subagent. Output: ${outputPath}` }] });
+			const childModel = resolveChildModelSelector(params.model, ctx.model);
+			const runId = randomUUID();
+			const childIndex = 0;
+			const orchestratorTarget = resolveIntercomSessionTarget(pi.getSessionName(), ctx.sessionManager.getSessionId());
+			const childSessionName = resolveSubagentIntercomTarget(runId, "test-builder", childIndex);
+			const intercomBridge = {
+				orchestratorTarget,
+				runId,
+				childAgent: "test-builder",
+				childIndex,
+				childSessionName,
+			};
+
+			onUpdate?.({
+				content: [
+					{
+						type: "text",
+						text: `Starting test-builder subagent. Output: ${outputPath}${childModel ? ` Model: ${childModel}.` : ""} Supervisor target: ${orchestratorTarget}.`,
+					},
+				],
+			});
 
 			const result = await runChildPi({
 				promptPath,
 				task,
 				cwd: targetPath,
-				model: resolveChildModelSelector(params.model, ctx.model),
+				model: childModel,
+				intercomBridge,
 				signal,
 				onText: (text) => onUpdate?.({ content: [{ type: "text", text }] }),
 			});
@@ -384,6 +486,9 @@ export default function testBuilderSubagentExtension(pi: ExtensionAPI) {
 						testDir: params.test_dir,
 						mode,
 						promptPath,
+						childModel,
+						observedModel: result.observedModel,
+						intercomBridge,
 						exitCode: result.exitCode,
 						stderr: tailText(result.stderr, DIAGNOSTIC_TEXT_CAP),
 						messageCount: result.messages.length,
@@ -404,6 +509,9 @@ export default function testBuilderSubagentExtension(pi: ExtensionAPI) {
 					testDir: params.test_dir,
 					mode,
 					promptPath,
+					childModel,
+					observedModel: result.observedModel,
+					intercomBridge,
 					exitCode: result.exitCode,
 					messageCount: result.messages.length,
 				},

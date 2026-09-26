@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -6,7 +7,17 @@ import { Type } from "typebox";
 
 const TOOL_NAME = "design_builder_subagent";
 const PROMPT_FILE = "design-builder-agent.md";
-const CHILD_TOOLS = "read,write,grep,find,ls,bash";
+const CHILD_TOOLS = "read,write,grep,find,ls,bash,contact_supervisor,intercom";
+const FINAL_TEXT_CAP = 24 * 1024;
+const DIAGNOSTIC_TEXT_CAP = 6 * 1024;
+
+const SAME_MODEL_ALIASES = new Set(["same", "current", "caller", "calling-agent", "same-as-calling-agent"]);
+const DEFAULT_INTERCOM_TARGET_PREFIX = "subagent-chat";
+const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
+const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
+const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
+const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
+const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
 
 type JsonEvent = {
 	type?: string;
@@ -60,15 +71,70 @@ function messageToText(message: unknown): string {
 	return contentToText((message as MessageLike).content);
 }
 
+function getEventRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function formatSupervisorWaitNotice(args: Record<string, unknown>, bridge: { orchestratorTarget: string; childSessionName: string } | undefined): string {
+	const reason = typeof args.reason === "string" ? args.reason : "unknown";
+	const message = typeof args.message === "string" ? args.message : "(no message text supplied)";
+	const lines = [
+		`Design builder called contact_supervisor with reason=${reason}.`,
+		"The design builder is paused waiting for the supervisor reply; this is expected for need_decision/interview_request.",
+		bridge ? `Supervisor target: ${bridge.orchestratorTarget}` : undefined,
+		bridge ? `Child intercom session: ${bridge.childSessionName}` : undefined,
+		"Reply from the parent Pi session with the immediate slash command:",
+		"/intercom-reply <your decision>",
+		"",
+		"Do not type a normal steering message like 'reply to the design builder...': steering is queued until the current design_builder_subagent tool finishes, so it cannot unblock the waiting child.",
+		"If the agent is already idle, the regular tool form also works: intercom({ action: \"reply\", message: \"<your decision>\" })",
+		"",
+		"Design-builder message:",
+		message,
+	];
+	return lines.filter((line): line is string => line !== undefined).join("\n");
+}
+
 function resolveChildModelSelector(rawModel: string | undefined, currentModel: { provider?: string; id?: string } | undefined): string | undefined {
 	const requested = rawModel?.trim();
-	if (requested && !["same", "current", "caller", "calling-agent", "same-as-calling-agent"].includes(requested.toLowerCase())) {
-		return requested;
-	}
-	if (currentModel?.provider && currentModel?.id) {
-		return `${currentModel.provider}/${currentModel.id}`;
-	}
+	if (requested && !SAME_MODEL_ALIASES.has(requested.toLowerCase())) return requested;
+	if (currentModel?.provider && currentModel?.id) return `${currentModel.provider}/${currentModel.id}`;
 	return undefined;
+}
+
+function truncateText(text: string, maxBytes: number): string {
+	const byteLength = Buffer.byteLength(text, "utf8");
+	if (byteLength <= maxBytes) return text;
+	let truncated = text.slice(0, maxBytes);
+	while (Buffer.byteLength(truncated, "utf8") > maxBytes) truncated = truncated.slice(0, -1);
+	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted.]`;
+}
+
+function tailText(text: string, maxBytes: number): string {
+	const byteLength = Buffer.byteLength(text, "utf8");
+	if (byteLength <= maxBytes) return text;
+	let tail = text.slice(-maxBytes);
+	while (Buffer.byteLength(tail, "utf8") > maxBytes) tail = tail.slice(1);
+	return `[Earlier output truncated: ${byteLength - Buffer.byteLength(tail, "utf8")} bytes omitted.]\n${tail}`;
+}
+
+function sanitizeIntercomTargetPart(value: string): string {
+	return value
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "") || "agent";
+}
+
+function resolveIntercomSessionTarget(sessionName: string | undefined, sessionId: string): string {
+	const trimmedName = sessionName?.trim();
+	if (trimmedName) return trimmedName;
+	const normalizedSessionId = sessionId.startsWith("session-") ? sessionId.slice("session-".length) : sessionId;
+	return `${DEFAULT_INTERCOM_TARGET_PREFIX}-${normalizedSessionId.slice(0, 8)}`;
+}
+
+function resolveSubagentIntercomTarget(runId: string, agent: string, index: number): string {
+	return `subagent-${sanitizeIntercomTargetPart(agent)}-${sanitizeIntercomTargetPart(runId)}-${index + 1}`;
 }
 
 function slugify(value: string): string {
@@ -239,6 +305,13 @@ async function runChildPi(options: {
 	task: string;
 	cwd: string;
 	model?: string;
+	intercomBridge?: {
+		orchestratorTarget: string;
+		runId: string;
+		childAgent: string;
+		childIndex: number;
+		childSessionName: string;
+	};
 	signal?: AbortSignal;
 	onText?: (text: string) => void;
 }): Promise<{
@@ -247,16 +320,28 @@ async function runChildPi(options: {
 	stderr: string;
 	messages: MessageLike[];
 	finalText: string;
+	observedModel?: string;
 }> {
-	const args = ["--mode", "json", "-p", "--no-session", "--tools", CHILD_TOOLS, "--append-system-prompt", options.promptPath];
+	const args = ["--mode", "json", "-p", "--no-session", "--no-skills", "--tools", CHILD_TOOLS, "--system-prompt", options.promptPath];
 	if (options.model?.trim()) args.push("--model", options.model.trim());
+	if (options.intercomBridge?.childSessionName) args.push("--name", options.intercomBridge.childSessionName);
 	args.push(options.task);
+
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	if (options.intercomBridge) {
+		childEnv[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = options.intercomBridge.orchestratorTarget;
+		childEnv[SUBAGENT_RUN_ID_ENV] = options.intercomBridge.runId;
+		childEnv[SUBAGENT_CHILD_AGENT_ENV] = options.intercomBridge.childAgent;
+		childEnv[SUBAGENT_CHILD_INDEX_ENV] = String(options.intercomBridge.childIndex);
+		childEnv[SUBAGENT_INTERCOM_SESSION_NAME_ENV] = options.intercomBridge.childSessionName;
+	}
 
 	return await new Promise((resolve) => {
 		const child = spawn("pi", args, {
 			cwd: options.cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			env: childEnv,
 		});
 
 		let stdout = "";
@@ -264,6 +349,7 @@ async function runChildPi(options: {
 		let lineBuffer = "";
 		const messages: MessageLike[] = [];
 		let finalText = "";
+		let observedModel: string | undefined;
 		let wasAborted = false;
 
 		const processLine = (line: string) => {
@@ -277,14 +363,27 @@ async function runChildPi(options: {
 				return;
 			}
 
+			if (event.type === "tool_execution_start" && event.toolName === "contact_supervisor") {
+				const args = getEventRecord(event.args) ?? getEventRecord(event.input) ?? {};
+				options.onText?.(formatSupervisorWaitNotice(args, options.intercomBridge));
+			}
+
+			if (event.type === "tool_result_end" && event.message && typeof event.message === "object") {
+				const message = event.message as MessageLike;
+				messages.push(message);
+				const text = messageToText(message).trim();
+				if (text) options.onText?.(truncateText(text, FINAL_TEXT_CAP));
+			}
+
 			if (event.type === "message_end" && event.message && typeof event.message === "object") {
 				const message = event.message as MessageLike;
 				messages.push(message);
+				if (message.model) observedModel = message.model;
 				if (message.role === "assistant") {
 					const text = messageToText(message).trim();
 					if (text) {
 						finalText = text;
-						options.onText?.(text);
+						options.onText?.(truncateText(text, FINAL_TEXT_CAP));
 					}
 				}
 			}
@@ -307,8 +406,8 @@ async function runChildPi(options: {
 
 		child.on("close", (code) => {
 			if (lineBuffer.trim()) processLine(lineBuffer);
-			if (wasAborted && !stderr.includes("aborted")) stderr += "Child Pi process aborted by parent signal.\n";
-			resolve({ exitCode: code ?? 1, stdout, stderr, messages, finalText });
+			if (wasAborted && !stderr.includes("aborted")) stderr += "Child Pi design-builder process aborted by parent signal.\n";
+			resolve({ exitCode: code ?? 1, stdout, stderr, messages, finalText, observedModel });
 		});
 
 		if (options.signal) {
@@ -433,13 +532,27 @@ export default function designBuilderSubagentExtension(pi: ExtensionAPI) {
 				resolvedOpenQuestions: params.resolved_open_questions,
 				originalRequest: params.original_request,
 			});
-			onUpdate?.({ content: [{ type: "text", text: `Starting design-builder subagent. Output: ${outputPath}` }] });
+			const childModel = resolveChildModelSelector(params.model, ctx.model);
+			const runId = randomUUID();
+			const childIndex = 0;
+			const orchestratorTarget = resolveIntercomSessionTarget(pi.getSessionName(), ctx.sessionManager.getSessionId());
+			const childSessionName = resolveSubagentIntercomTarget(runId, "design-builder", childIndex);
+			const intercomBridge = {
+				orchestratorTarget,
+				runId,
+				childAgent: "design-builder",
+				childIndex,
+				childSessionName,
+			};
+
+			onUpdate?.({ content: [{ type: "text", text: `Starting design-builder subagent. Output: ${outputPath}${childModel ? ` with model ${childModel}` : ""}. Supervisor target: ${orchestratorTarget}.` }] });
 
 			const result = await runChildPi({
 				promptPath,
 				task,
 				cwd,
-				model: resolveChildModelSelector(params.model, ctx.model),
+				model: childModel,
+				intercomBridge,
 				signal,
 				onText: (text) => onUpdate?.({ content: [{ type: "text", text }] }),
 			});
@@ -449,8 +562,8 @@ export default function designBuilderSubagentExtension(pi: ExtensionAPI) {
 					`Design-builder subagent failed with exit code ${result.exitCode}.`,
 					!fs.existsSync(outputPath) ? `Expected output file was not created: ${outputPath}` : "",
 					!fs.existsSync(projectDesignFile) ? `Expected project design file was not created or updated: ${projectDesignFile}` : "",
-					result.stderr.trim() ? `stderr:\n${result.stderr.trim()}` : "",
-					!result.finalText.trim() && result.stdout.trim() ? `stdout:\n${result.stdout.trim().slice(-4000)}` : "",
+					result.stderr.trim() ? `stderr:\n${tailText(result.stderr.trim(), DIAGNOSTIC_TEXT_CAP)}` : "",
+					!result.finalText.trim() && result.stdout.trim() ? `stdout:\n${tailText(result.stdout.trim(), DIAGNOSTIC_TEXT_CAP)}` : "",
 				]
 					.filter(Boolean)
 					.join("\n\n");
@@ -470,8 +583,11 @@ export default function designBuilderSubagentExtension(pi: ExtensionAPI) {
 						slug,
 						metadataSource,
 						promptPath,
+						childModel,
+						observedModel: result.observedModel,
+						intercomBridge,
 						exitCode: result.exitCode,
-						stderr: result.stderr,
+						stderr: tailText(result.stderr, DIAGNOSTIC_TEXT_CAP),
 						messageCount: result.messages.length,
 					},
 					isError: true,
@@ -479,7 +595,7 @@ export default function designBuilderSubagentExtension(pi: ExtensionAPI) {
 			}
 
 			return {
-				content: [{ type: "text", text: result.finalText }],
+				content: [{ type: "text", text: truncateText(result.finalText, FINAL_TEXT_CAP) }],
 				details: {
 					cwd,
 					requestFile,
@@ -493,6 +609,9 @@ export default function designBuilderSubagentExtension(pi: ExtensionAPI) {
 					slug,
 					metadataSource,
 					promptPath,
+					childModel,
+					observedModel: result.observedModel,
+					intercomBridge,
 					exitCode: result.exitCode,
 					messageCount: result.messages.length,
 				},
